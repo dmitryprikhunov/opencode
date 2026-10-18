@@ -1,0 +1,12 @@
+FROM node:24.22.0-bookworm-slim AS node
+FROM oven/bun:1.4.2-debian
+
+USER root
+COPY --from=node /usr/local/bin/node /usr/local/bin/node
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash ca-certificates curl git python3 make g++ pkg-config unzip \
+    && rm -rf /var/lib/apt/lists/*
+ENV ELECTRON_SKIP_BINARY_DOWNLOAD=1
+WORKDIR /src
+CMD ["bash"]
