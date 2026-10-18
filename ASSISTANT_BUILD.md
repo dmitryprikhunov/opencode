@@ -62,7 +62,7 @@ To build the separate `opencode-assistant` image with one of these binaries:
 ```bash
 docker build -t opencode-assistant:custom \
   --build-arg OPENCODE_USE_LOCAL_BINARY=true \
-  --secret id=opencode_binary,src=/absolute/path/to/artifacts/linux-x64/opencode-v2 \
+  --build-context opencode_binary=/absolute/path/to/artifacts/linux-x64 \
   /absolute/path/to/opencode-assistant
 ```
 
