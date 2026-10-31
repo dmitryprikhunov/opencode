@@ -1,7 +1,7 @@
 import { createEffect, createMemo, onCleanup, untrack } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Schema } from "effect"
-import type { SessionInfo } from "@opencode/client/promise"
+import { isSessionNotFoundError, type SessionInfo } from "@opencode/client/promise"
 import type { ServerSDK } from "@/runtime/server/client"
 import type { Data } from "@opencode/client/solid"
 import { usePlatform } from "@/runtime/platform/platform"
@@ -17,12 +17,32 @@ import { useServer } from "@/runtime/server/current"
 
 type NotificationTabs = Pick<ReturnType<typeof useTabs>, "addSessionTab" | "rememberSessionRoute" | "select">
 
+const requestTitles = {
+  permission: "notification.permission.title",
+  question: "notification.question.title",
+  "mcp-elicitation": "notification.elicitation.title",
+  "websearch.provider": "notification.permission.title",
+} as const
+
 export function openNotificationSession(tabs: NotificationTabs, server: ServerConnection.Key, sessionID: string) {
   const tab = tabs.addSessionTab({ server, sessionId: sessionID })
 
   if (tab.type !== "session") return
   tabs.rememberSessionRoute(tab, sessionID)
   tabs.select(tab)
+}
+
+// Only direct children: a grandchild reports to its own parent, so waiting on it could mean no sound at all. Running
+// shells don't count, or a session with a dev server running would never play one.
+function hasRunningChild(data: Data, sessionID: string) {
+  return data.session
+    .family(sessionID)
+    .some(
+      (child) =>
+        child !== sessionID &&
+        data.session.get(child)?.parentID === sessionID &&
+        data.session.status(child) === "running",
+    )
 }
 
 /** A session is unread when its latest terminal execution is newer than the last one any client viewed. */
@@ -188,7 +208,14 @@ export function createServerNotificationState(input: {
         viewRetryTimer = undefined
         viewRetryAttempt = 0
       },
-      () => {
+      (error) => {
+        if (isSessionNotFoundError(error)) {
+          acknowledged.delete(root)
+          input.data.session.forget(root)
+
+          return
+        }
+
         if (acknowledged.get(root) !== idle) return
         acknowledged.delete(root)
 
@@ -217,6 +244,9 @@ export function createServerNotificationState(input: {
   }
 
   const handleSessionIdle = (sessionID: string, eventID: string) => {
+    // A running subagent's report wakes the session again, so it isn't done yet.
+    if (hasRunningChild(input.data, sessionID)) return
+
     void lookup(sessionID).then((session) => {
       if (disposed.value) return
 
@@ -264,7 +294,7 @@ export function createServerNotificationState(input: {
     })
   }
 
-  const handleRequest = async (kind: "permission" | "question", sessionID: string, requestID: string) => {
+  const handleRequest = async (kind: keyof typeof requestTitles, sessionID: string, requestID: string) => {
     const session = await lookup(sessionID)
 
     if (!session || disposed.value) return
@@ -275,33 +305,35 @@ export function createServerNotificationState(input: {
 
     if (!sessionIDHasOpenTab(tabs.store, input.key, target)) return
 
+    const category = kind === "question" || kind === "mcp-elicitation" ? "questions" : "permissions"
+
     const pending = () => {
       if (disposed.value) return false
 
-      if (kind === "question") return input.data.session.form.list(sessionID)?.some((form) => form.id === requestID)
+      if (kind !== "permission") return input.data.session.form.list(sessionID)?.some((form) => form.id === requestID)
 
       if (settings.permissions.autoApproves(projectSettingsKey(input.sdk.scope, session.projectID))) return false
 
       return input.data.session.permission.list(sessionID)?.some((request) => request.id === requestID)
     }
 
+    if (!pending()) return
+
     const key = `${input.key}\0${kind}:${requestID}`
 
-    if (settings.sounds.permissionsEnabled() && pending()) {
+    if (settings.sounds[`${category}Enabled`]()) {
       void input.coordinator.sound(key, () => {
-        if (pending()) return playSoundById(settings.sounds.permissions())
+        if (pending()) return playSoundById(settings.sounds[category]())
       })
     }
 
-    if (!settings.notifications.permissions() || !pending()) return
+    if (!settings.notifications[category]()) return
 
     void input.coordinator.system(key, () => {
       if (!pending()) return
 
-      return platform.notify(
-        language.t(kind === "permission" ? "notification.permission.title" : "notification.question.title"),
-        session.title ?? sessionID,
-        () => openNotificationSession(tabs, input.key, target),
+      return platform.notify(language.t(requestTitles[kind]), session.title ?? sessionID, () =>
+        openNotificationSession(tabs, input.key, target),
       )
     })
   }
@@ -313,8 +345,12 @@ export function createServerNotificationState(input: {
       return
     }
 
-    if (event.type === "form.created" && event.data.form.metadata?.kind === "question") {
-      void handleRequest("question", event.data.form.sessionID, event.data.form.id)
+    if (event.type === "form.created") {
+      const kind = event.data.form.metadata?.kind
+
+      if (kind === "question" || kind === "mcp-elicitation" || kind === "websearch.provider") {
+        void handleRequest(kind, event.data.form.sessionID, event.data.form.id)
+      }
 
       return
     }

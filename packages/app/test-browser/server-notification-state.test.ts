@@ -9,18 +9,6 @@ import type { createNotificationCoordinator } from "@/shell/notifications/coordi
 
 type NotificationDelivery = Parameters<ReturnType<typeof createNotificationCoordinator>["system"]>[1]
 
-type RequestCase = {
-  name: string
-  kind: "permission" | "question"
-  autoApprove: boolean
-  agentNotifications: boolean
-  resolve: boolean
-  tab: string
-  alert?: string
-  sound: boolean
-  target?: string
-}
-
 // SAFETY: this is the key format `ServerConnection.key` produces for a local server.
 const server = "local\nhttp://localhost:4096" as ServerConnection.Key
 
@@ -33,8 +21,6 @@ const sounds: string[] = []
 const clicks: Array<() => void> = []
 
 const selected: string[] = []
-
-const preferences = { autoApprove: false, agentNotifications: true }
 
 const tabs = {
   store: new Array<Tab>(),
@@ -49,6 +35,15 @@ const tabs = {
 }
 
 let createServerNotificationState: typeof import("@/shell/notifications/notification").createServerNotificationState
+
+const preferences = {
+  autoApprove: false,
+  agent: true,
+  permissions: true,
+  questions: true,
+  permissionsSound: true,
+  questionsSound: true,
+}
 
 // Each test fakes only the parts of the SDK, data store and coordinator that the notification state reads.
 const createState = (input: { sdk: object; data: object; coordinator: object }) =>
@@ -76,26 +71,29 @@ beforeAll(async () => {
       },
     }),
   }))
+  mock.module("@/runtime/i18n/language", () => ({
+    ...real.language,
+    useLanguage: () => ({ t: (key: string) => key }),
+  }))
   mock.module("@/settings/model", () => ({
     ...real.settings,
     useSettings: () => ({
       sounds: {
         agentEnabled: () => false,
         errorsEnabled: () => false,
-        permissionsEnabled: () => true,
+        permissionsEnabled: () => preferences.permissionsSound,
         permissions: () => "alert-01",
+        questionsEnabled: () => preferences.questionsSound,
+        questions: () => "alert-02",
       },
       notifications: {
-        agent: () => preferences.agentNotifications,
+        agent: () => preferences.agent,
         errors: () => true,
-        permissions: () => true,
+        permissions: () => preferences.permissions,
+        questions: () => preferences.questions,
       },
       permissions: { autoApproves: () => preferences.autoApprove },
     }),
-  }))
-  mock.module("@/runtime/i18n/language", () => ({
-    ...real.language,
-    useLanguage: () => ({ t: (key: string) => key }),
   }))
   mock.module("@/shell/tabs/tabs", () => ({ ...real.tabs, useTabs: () => tabs }))
   mock.module("@/shell/notifications/sound", () => ({
@@ -111,47 +109,57 @@ beforeEach(() => {
   sounds.length = 0
   clicks.length = 0
   selected.length = 0
-  Object.assign(preferences, { autoApprove: false, agentNotifications: true })
+  Object.assign(preferences, {
+    autoApprove: false,
+    agent: true,
+    permissions: true,
+    questions: true,
+    permissionsSound: true,
+    questionsSound: true,
+  })
 })
 
+const requests = [
+  { kind: "permission", category: "permissions", title: "notification.permission.title" },
+  { kind: "question", category: "questions", title: "notification.question.title" },
+  { kind: "mcp-elicitation", category: "questions", title: "notification.elicitation.title" },
+  { kind: "websearch.provider", category: "permissions", title: "notification.permission.title" },
+] as const
+
 test.each(
-  [
-    { name: "permission request", alert: "notification.permission.title", sound: true, target: session.id },
-    {
-      name: "question",
-      kind: "question" as const,
-      agentNotifications: false,
-      alert: "notification.question.title",
-      sound: true,
-      target: session.id,
-    },
-    { name: "auto-approved request", autoApprove: true },
-    { name: "request resolved while queued", resolve: true },
-    {
-      name: "child request with root tab",
-      tab: "root",
-      alert: "notification.permission.title",
-      sound: true,
-      target: "root",
-    },
-  ].map(
-    (options): RequestCase => ({
-      kind: "permission" as const,
-      autoApprove: false,
-      agentNotifications: true,
-      resolve: false,
-      tab: session.id,
-      alert: undefined,
-      sound: false,
-      target: undefined,
-      ...options,
-    }),
+  requests.flatMap((request) =>
+    [
+      "enabled",
+      "other category disabled",
+      "notifications disabled",
+      "sound disabled",
+      "resolved",
+      "auto approve",
+      "root tab",
+      "no tab",
+      "disposed",
+    ].map((scenario) => ({ ...request, scenario })),
   ),
-)("request alerts: $name", async (options) => {
-  Object.assign(preferences, options)
-  tabs.store = [{ type: "session", server, sessionId: options.tab }]
+)("request alerts: $kind / $scenario", async (options) => {
+  preferences.agent = false
+  preferences.autoApprove = options.scenario === "auto approve"
+  preferences[options.category] = options.scenario !== "notifications disabled"
+  preferences[options.category === "questions" ? "questionsSound" : "permissionsSound"] =
+    options.scenario !== "sound disabled"
+
+  if (options.scenario === "other category disabled") {
+    preferences[options.category === "questions" ? "permissions" : "questions"] = false
+    preferences[options.category === "questions" ? "permissionsSound" : "questionsSound"] = false
+  }
+
+  tabs.store =
+    options.scenario === "no tab"
+      ? []
+      : [{ type: "session", server, sessionId: options.scenario === "root tab" ? "root" : session.id }]
   const listeners = new Array<(event: OpenCodeEvent) => void>()
+
   const deliveries = new Array<NotificationDelivery>()
+
   const pending = { value: true }
 
   const dispose = createRoot((dispose) => {
@@ -168,7 +176,7 @@ test.each(
       },
       data: {
         session: {
-          get: () => ({ ...session, parentID: "root" }),
+          get: () => ({ ...session, parentID: "root", projectID: "project-1" }),
           root: () => "root",
           permission: { list: () => (pending.value ? [{ id: "request-1" }] : []) },
           form: { list: () => (pending.value ? [{ id: "request-1" }] : []) },
@@ -188,25 +196,51 @@ test.each(
   })
 
   try {
-    listeners.forEach((listener) =>
-      // SAFETY: only the request identity, session and form kind are read by the handler.
-      listener({
-        type: options.kind === "permission" ? "permission.asked" : "form.created",
-        data:
-          options.kind === "permission"
-            ? { sessionID: session.id, id: "request-1" }
-            : { form: { sessionID: session.id, id: "request-1", metadata: { kind: "question" } } },
-      } as never),
-    )
+    const event: OpenCodeEvent =
+      options.kind === "permission"
+        ? {
+            id: "event-1",
+            created: 0,
+            location: session.location,
+            type: "permission.asked",
+            data: { sessionID: session.id, id: "request-1", action: "shell", resources: [], metadata: {} },
+          }
+        : {
+            id: "event-1",
+            created: 0,
+            location: session.location,
+            type: "form.created",
+            data: {
+              form: {
+                sessionID: session.id,
+                id: "request-1",
+                title: "Input",
+                fields: [{ key: "answer", type: "string", title: "Continue?" }],
+                metadata: { kind: options.kind },
+              },
+            },
+          }
+
+    listeners.forEach((listener) => listener(event))
     await Promise.resolve()
 
-    if (options.resolve) pending.value = false
+    if (options.scenario === "resolved") pending.value = false
+
+    if (options.scenario === "disposed") dispose()
     await Promise.all(deliveries.map((run) => run()))
 
-    expect(alerts).toEqual(options.alert ? [options.alert] : [])
-    expect(sounds).toEqual(options.sound ? ["alert-01"] : [])
+    const suppressed =
+      ["resolved", "disposed", "no tab"].includes(options.scenario) ||
+      (options.scenario === "auto approve" && options.kind === "permission")
+
+    expect(alerts).toEqual(!suppressed && options.scenario !== "notifications disabled" ? [options.title] : [])
+    expect(sounds).toEqual(
+      !suppressed && options.scenario !== "sound disabled"
+        ? [options.category === "questions" ? "alert-02" : "alert-01"]
+        : [],
+    )
     clicks.forEach((click) => click())
-    expect(selected).toEqual(options.target ? [options.target] : [])
+    expect(selected).toEqual(alerts.length ? [options.scenario === "root tab" ? "root" : session.id] : [])
   } finally {
     dispose()
   }
@@ -238,7 +272,7 @@ test.each([
           },
         },
       },
-      data: { session: { get: () => session } },
+      data: { session: { get: () => session, family: () => [session.id], status: () => "idle" } },
       coordinator: { system: async (_id: string, fn: () => Promise<void>) => fn() },
     })
 
