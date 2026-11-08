@@ -19,7 +19,7 @@ for arch in "${arches[@]}"; do
     esac
     output="$root/artifacts/$arch"
     # Build each target into its own directory; build.ts clears --outdir on entry.
-    bun run packages/cli/script/build.ts --skip-install --target="$target" --outdir="$root/artifacts/.build/$arch"
+    OPENCODE_TARGET="${target#opencode-}" bun run packages/cli/script/build.ts --skip-install --outdir="$root/artifacts/.build/$arch"
     mkdir -p "$output"
     install -m 755 "$root/artifacts/.build/$arch/$package/bin/opencode" "$output/opencode-v2"
     (
@@ -27,7 +27,7 @@ for arch in "${arches[@]}"; do
         sha256sum opencode-v2 > SHA256SUMS
         printf 'version=%s\nsource=%s\nupstream_pr=%s\ntarget=%s\n' \
             "$OPENCODE_VERSION" "$(git rev-parse HEAD)" \
-            'https://github.com/anomalyco/opencode/pull/56044' "$target" > build-info.txt
+            'https://github.com/anomalyco/opencode/pull/48779' "$target" > build-info.txt
     )
 done
 printf 'Builds saved under %s/artifacts/\n' "$root"
